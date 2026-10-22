@@ -3,57 +3,72 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ClaimChecker on GenLayer</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem;color:#222}
-input,textarea,button{width:100%;padding:.7rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;max-width:680px;margin:2rem auto;padding:0 1rem;color:#222}
+input,textarea,button,select{width:100%;padding:.7rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box}
 button{background:#7c3aed;color:#fff;border:0;border-radius:8px;cursor:pointer}
-button:disabled{opacity:.5}
+button.small{width:auto;padding:.3rem .7rem;font-size:.85rem;margin:.3rem 0 0}
+button:disabled{opacity:.5}.row{display:flex;gap:.5rem}.row>*{flex:1}
 .card{border:1px solid #ddd;border-radius:10px;padding:.8rem;margin:.6rem 0}
 .TRUE{border-left:6px solid #16a34a}.FALSE{border-left:6px solid #dc2626}.UNVERIFIABLE{border-left:6px solid #ca8a04}
-small{color:#666;word-break:break-all}
+small{color:#666;word-break:break-all}#stats{background:#f3f0ff;border-radius:10px;padding:.7rem}
 </style></head><body>
-<h1>ClaimChecker</h1>
-<p>Submit a claim and a source URL. GenLayer validators read the page, reach consensus, and store the verdict on-chain.</p>
-<label>Contract address</label><input id="addr" placeholder="0x...">
+<h1>ClaimChecker <small>v2</small></h1>
+<p>Submit a claim and a source URL. GenLayer validators read the page, reach consensus, and store the verdict on-chain. Verdicts can be re-checked later and the history is kept.</p>
+<label>Contract address</label><input id="addr" value="0x893cd900f7E16C600605fF142f2D7362379Edc5F">
 <label>Claim</label><textarea id="claim" rows="3" placeholder="e.g. The Eiffel Tower is 330 m tall"></textarea>
 <label>Source URL</label><input id="url" placeholder="https://en.wikipedia.org/wiki/Eiffel_Tower">
 <button id="go">Check claim</button>
 <p id="status"></p>
-<h2>Recent verdicts</h2><div id="list"></div>
+<div id="stats">Stats: …</div>
+<h2>Verdicts</h2>
+<select id="filter"><option value="">All (latest 10)</option><option>TRUE</option><option>FALSE</option><option>UNVERIFIABLE</option></select>
+<div id="list"></div>
 <script type="module">
 import { createClient, createAccount } from "https://esm.sh/genlayer-js@latest";
 import { studionet } from "https://esm.sh/genlayer-js@latest/chains";
-
 let key = localStorage.getItem("gl_key");
 const account = key ? createAccount(key) : createAccount();
 if (!key) localStorage.setItem("gl_key", account.privateKey ?? "");
 const client = createClient({ chain: studionet, account });
 const $ = id => document.getElementById(id);
-$("addr").value = localStorage.getItem("gl_addr") || "";
-
-async function load() {
-  const address = $("addr").value.trim();
-  if (!address) return;
-  localStorage.setItem("gl_addr", address);
-  const n = Number(await client.readContract({ address, functionName: "get_count", args: [] }));
-  $("list").innerHTML = "";
-  for (let i = n - 1; i >= Math.max(0, n - 10); i--) {
-    const raw = await client.readContract({ address, functionName: "get_claim", args: [String(i)] });
-    if (!raw) continue;
-    const c = JSON.parse(raw);
-    $("list").innerHTML += `<div class="card ${c.verdict}"><b>${c.verdict}</b> — ${c.claim}<br>${c.reason}<br><small>${c.source_url}</small></div>`;
-  }
-}
-
-$("go").onclick = async () => {
-  const address = $("addr").value.trim(), claim = $("claim").value.trim(), url = $("url").value.trim();
-  if (!address || !claim || !url) return ($("status").textContent = "Fill all fields.");
-  $("go").disabled = true; $("status").textContent = "Sending transaction… validators are reaching consensus (can take ~1 min).";
+const addr = () => $("addr").value.trim();
+const read = (fn, args=[]) => client.readContract({ address: addr(), functionName: fn, args });
+async function send(fn, args) {
+  $("status").textContent = "Sending transaction… waiting for validator consensus (~1 min).";
   try {
-    const hash = await client.writeContract({ address, functionName: "check_claim", args: [claim, url], value: 0n });
+    const hash = await client.writeContract({ address: addr(), functionName: fn, args, value: 0n });
     await client.waitForTransactionReceipt({ hash, status: "ACCEPTED", retries: 60, interval: 3000 });
     $("status").textContent = "Done ✅"; await load();
   } catch (e) { $("status").textContent = "Error: " + (e.message || e); }
-  $("go").disabled = false;
+}
+function card(c) {
+  const h = (c.history || []).join(" → ");
+  return `<div class="card ${c.verdict}"><b>${c.verdict}</b> — ${c.claim}<br>${c.reason}<br>
+  <small>${c.source_url}</small><br><small>history: ${h} (rechecks: ${c.rechecks})</small><br>
+  <button class="small" data-id="${c.id}">Re-check</button></div>`;
+}
+async function load() {
+  if (!addr()) return;
+  localStorage.setItem("gl_addr", addr());
+  try {
+    const s = JSON.parse(await read("get_stats"));
+    $("stats").textContent = `Total ${s.total} · TRUE ${s.TRUE} · FALSE ${s.FALSE} · UNVERIFIABLE ${s.UNVERIFIABLE} · re-checked ${s.rechecked} · flipped ${s.flipped}`;
+    const f = $("filter").value; let items = [];
+    if (f) items = JSON.parse(await read("get_claims_by_verdict", [f]));
+    else {
+      const n = Number(await read("get_count"));
+      for (let i = n - 1; i >= Math.max(0, n - 10); i--) {
+        const raw = await read("get_claim", [String(i)]); if (raw) items.push(JSON.parse(raw));
+      }
+    }
+    $("list").innerHTML = items.map(card).join("");
+    document.querySelectorAll("button.small").forEach(b => b.onclick = () => send("recheck_claim", [b.dataset.id]));
+  } catch (e) { $("status").textContent = "Read error: " + (e.message || e); }
+}
+$("go").onclick = () => {
+  const claim = $("claim").value.trim(), url = $("url").value.trim();
+  if (!addr() || !claim || !url) return ($("status").textContent = "Fill all fields.");
+  send("check_claim", [claim, url]);
 };
-$("addr").onchange = load; load();
+$("filter").onchange = load; $("addr").onchange = load; load();
 </script></body></html>
